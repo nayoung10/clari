@@ -9,6 +9,7 @@ import contextlib
 import fcntl
 import getpass
 import hashlib
+import heapq
 import json
 import os
 import pathlib
@@ -17,6 +18,7 @@ import select
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -80,10 +82,27 @@ def validate(directory, requested):
     return sorted(set(requested) - set(gcd))
 
 
+class DeferredChunk(RuntimeError):
+    def __init__(self, name, retry_at, attempts):
+        super().__init__(f"Chunk {name} deferred after {attempts} script-launch failures")
+        self.name, self.retry_at, self.attempts = name, retry_at, attempts
+
+
 class Exporter:
-    def __init__(self, root, command, databases, timeout):
+    def __init__(
+        self,
+        root,
+        command,
+        databases,
+        timeout,
+        scratch_dir="/tmp",
+        retry_delay=5,
+        retry_max_delay=300,
+    ):
         self.root, self.command, self.databases = root, command, databases
         self.timeout = timeout
+        self.scratch_dir = scratch_dir
+        self.retry_delay, self.retry_max_delay = retry_delay, retry_max_delay
         self.stop = threading.Event()
         self.launched = 0
         self.fresh_accounted = 0
@@ -95,6 +114,29 @@ class Exporter:
         self.test_families = set(runpy.run_path(str(csd))["AVAILABLE_CSD_SUBSETS"]["test"])
 
     def invoke(self, directory, ids):
+        retry_path = directory / "retry.json"
+        retry = json.loads(retry_path.read_text()) if retry_path.exists() else {}
+        if retry.get("retry_at", 0) > time.time():
+            raise DeferredChunk(directory.name, retry["retry_at"], retry["attempts"])
+        # Keep only disposable ConQuest scratch on the node. Outputs/checkpoints stay shared.
+        with tempfile.TemporaryDirectory(prefix="clari-conquest-", dir=self.scratch_dir) as scratch:
+            result = self.invoke_attempt(directory, ids, scratch)
+        if result["status"] == "permission_retry":
+            attempts = retry.get("attempts", 0) + 1
+            delay = min(self.retry_max_delay, self.retry_delay * 2 ** min(attempts - 1, 16))
+            retry = {
+                "attempts": attempts,
+                "retry_at": time.time() + delay,
+                "error": result["error"],
+            }
+            # Retain the latest failure log and durable retry history without unbounded log growth.
+            (directory / "console.log").replace(directory / "permission-failure.log")
+            atomic_json(retry_path, retry)
+            raise DeferredChunk(directory.name, retry["retry_at"], attempts)
+        retry_path.unlink(missing_ok=True)
+        return result
+
+    def invoke_attempt(self, directory, ids, scratch):
         if self.stop.is_set():
             raise InterruptedError("Export stopped; completed chunks are retained")
         for ext in (*FORMATS, "cqs"):
@@ -106,7 +148,7 @@ class Exporter:
             "export",
             # ConQuest otherwise shares ~/csds_data/searches/batch27 across processes.
             "-user-directory",
-            str(directory / "conquest-user"),
+            scratch,
             "-db",
             *self.databases,
             "-require",
@@ -165,6 +207,13 @@ class Exporter:
                 "unmatched": unmatched,
                 "hashes": {ext: digest(directory / f"export.{ext}") for ext in FORMATS},
             }
+        # A generated search-script launch failure is infrastructure, never a bad entry.
+        if (
+            "PermissionError: [Errno 13] Permission denied:" in log
+            and "create_and_run_thomas_script" in log
+            and re.search(r"Permission denied: .*[/\\]searches[/\\].*\.sh['\"]", log)
+        ):
+            return {"status": "permission_retry", "error": log[-5000:]}
         # Only a traceback inside the entry exporter is eligible for bisection/skipping.
         # License, display, database, OOM, timeout, and disk failures abort instead.
         infrastructure = re.search(
@@ -238,8 +287,17 @@ def export_main(
     workers: int = 4,
     chunk_size: int = 1000,
     timeout: int = 1800,
+    scratch_dir: str = "/tmp",
+    retry_delay: float = 5,
+    retry_max_delay: float = 300,
 ):
-    if workers < 1 or chunk_size < 1 or timeout < 1:
+    if (
+        workers < 1
+        or chunk_size < 1
+        or timeout < 1
+        or retry_delay <= 0
+        or retry_max_delay < retry_delay
+    ):
         raise ValueError("workers, chunk_size, and timeout must be positive")
     if not os.environ.get("DISPLAY"):
         raise RuntimeError("ConQuest restriction needs DISPLAY; run this command under Xvfb")
@@ -292,34 +350,88 @@ def export_main(
             raise RuntimeError("Export inputs/version/options changed; use a new output directory")
         atomic_json(config_path, config)
         (root / "any.mol").write_text(QUERY)
-        exporter = Exporter(root, command, databases, timeout)
+        exporter = Exporter(
+            root, command, databases, timeout, scratch_dir, retry_delay, retry_max_delay
+        )
         old_handlers = {}
         for sig in (signal.SIGINT, signal.SIGTERM):
             old_handlers[sig] = signal.signal(sig, lambda *_: exporter.stop.set())
         started, accounted, leaves = time.monotonic(), 0, []
         try:
+            # Deferred chunks release their worker slot; healthy chunks continue immediately.
+            pending = [
+                (0, i, f"{i // chunk_size:06d}-", ids[i : i + chunk_size])
+                for i in range(0, len(ids), chunk_size)
+            ]
+            heapq.heapify(pending)
+            serial = len(ids)
+            active = {}
+            failures, probe_only, blocked_until = 0, False, 0
+            heartbeat = time.monotonic()
             with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(exporter.chunk, f"{i // chunk_size:06d}-", ids[i : i + chunk_size])
-                    for i in range(0, len(ids), chunk_size)
-                }
                 try:
-                    for future in cf.as_completed(futures):
-                        result = future.result()
-                        leaves.extend(result)
-                        accounted += sum(leaf["requested"] for leaf in result)
-                        elapsed = time.monotonic() - started
-                        fresh = exporter.fresh_accounted
-                        eta = ((len(ids) - accounted) * elapsed / fresh / 3600) if fresh else None
-                        eta_text = f"{eta:.2f}h" if eta is not None else "waiting for new work"
-                        print(
-                            f"Accounted {accounted:,}/{len(ids):,}; "
-                            f"elapsed {elapsed:.0f}s; ETA {eta_text}",
-                            flush=True,
+                    while pending or active:
+                        if exporter.stop.is_set():
+                            raise InterruptedError("Export stopped; completed chunks are retained")
+                        now = time.time()
+                        limit = 1 if probe_only else workers
+                        while (
+                            pending
+                            and len(active) < limit
+                            and now >= blocked_until
+                            and pending[0][0] <= now
+                        ):
+                            _, _, name, chunk_ids = heapq.heappop(pending)
+                            active[pool.submit(exporter.chunk, name, chunk_ids)] = (name, chunk_ids)
+                        done, _ = (
+                            cf.wait(active, timeout=0.2, return_when=cf.FIRST_COMPLETED)
+                            if active
+                            else (set(), set())
                         )
+                        if not active and not done:
+                            exporter.stop.wait(0.2)
+                        for future in done:
+                            name, chunk_ids = active.pop(future)
+                            try:
+                                result = future.result()
+                            except DeferredChunk as exc:
+                                failures += 1
+                                serial += 1
+                                heapq.heappush(pending, (exc.retry_at, serial, name, chunk_ids))
+                                print(
+                                    f"Deferred {exc.name}: script permission failure #{exc.attempts}; "
+                                    f"retry in {max(0, exc.retry_at - time.time()):.1f}s",
+                                    flush=True,
+                                )
+                                if failures >= 8:
+                                    probe_only = True
+                                    blocked_until = max(blocked_until, exc.retry_at)
+                                continue
+                            failures, probe_only, blocked_until = 0, False, 0
+                            leaves.extend(result)
+                            accounted += sum(leaf["requested"] for leaf in result)
+                            elapsed = time.monotonic() - started
+                            fresh = exporter.fresh_accounted
+                            eta = (
+                                ((len(ids) - accounted) * elapsed / fresh / 3600) if fresh else None
+                            )
+                            eta_text = f"{eta:.2f}h" if eta is not None else "waiting for new work"
+                            print(
+                                f"Accounted {accounted:,}/{len(ids):,}; elapsed {elapsed:.0f}s; "
+                                f"ETA {eta_text}",
+                                flush=True,
+                            )
+                        if time.monotonic() - heartbeat >= 30:
+                            print(
+                                f"Export alive: {accounted:,}/{len(ids):,} accounted; "
+                                f"{len(active)} running, {len(pending)} pending; "
+                                f"recovery probe mode={probe_only}",
+                                flush=True,
+                            )
+                            heartbeat = time.monotonic()
                 except BaseException:
                     exporter.stop.set()
-                    for future in futures:
+                    for future in active:
                         future.cancel()
                     raise
             if exporter.stop.is_set():
@@ -381,9 +493,23 @@ def main(
     chunk_size: int = 1000,
     timeout: int = 1800,
     xvfb: str = "Xvfb",
+    scratch_dir: str = "/tmp",
+    retry_delay: float = 5,
+    retry_max_delay: float = 300,
 ):
     with virtual_display(xvfb, pathlib.Path(out).resolve()):
-        export_main(metadata, out, cqbatch, databases, workers, chunk_size, timeout)
+        export_main(
+            metadata,
+            out,
+            cqbatch,
+            databases,
+            workers,
+            chunk_size,
+            timeout,
+            scratch_dir,
+            retry_delay,
+            retry_max_delay,
+        )
 
 
 if __name__ == "__main__":

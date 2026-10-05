@@ -24,9 +24,13 @@ import pathlib, sys, os, time
 if '-version' in sys.argv:
     print('Fake ConQuest 1'); sys.exit(0)
 scratch = pathlib.Path(sys.argv[sys.argv.index('-user-directory')+1])
-assert scratch == pathlib.Path.cwd() / 'conquest-user'
+assert scratch.is_dir() and scratch.name.startswith('clari-conquest-')
+with pathlib.Path('scratch-paths').open('a') as f: f.write(str(scratch)+'\\n')
 ids = pathlib.Path(sys.argv[sys.argv.index('-restrict')+1]).read_text().split()
 with pathlib.Path('attempts').open('a') as f: f.write('run\\n')
+if (('PERMFL' in ids or any(x.startswith('RETRY') for x in ids)) and len(pathlib.Path('attempts').read_text().splitlines()) <= 3) or ('PERMAL' in ids and not pathlib.Path('recovered').exists()):
+    print("Traceback (most recent call last):\\n  search/search_runner.py create_and_run_thomas_script\\nPermissionError: [Errno 13] Permission denied: '/tmp/scratch/csds_data/searches/batch27/search.sh'")
+    sys.exit(1)
 if 'SLOWWW' in ids and not pathlib.Path('slow-once').exists():
     pathlib.Path('slow-once').write_text(str(os.getpid()))
     time.sleep(60)
@@ -186,3 +190,69 @@ def test_entire_restriction_absent_is_accounted(setup):
     manifest = json.loads((root / "export/manifest.json").read_text())
     assert manifest["chunks"][0]["unmatched"] == ["ABSENT"]
     assert manifest["chunks"][0]["status"] == "complete"
+
+
+def test_repeated_permission_errors_defer_while_healthy_chunks_finish(setup):
+    root, args = setup
+    pl.DataFrame({"id": ["AAAAAA", "PERMFL"]}).write_parquet(args["metadata"])
+    args.update(chunk_size=1, retry_delay=0.1, retry_max_delay=0.2)
+    export.export_main(**args, workers=1)
+    chunks = root / "export/chunks"
+    assert len((chunks / "000001-/attempts").read_text().splitlines()) == 4
+    assert (chunks / "000000-/state.json").stat().st_mtime_ns < (
+        chunks / "000001-/state.json"
+    ).stat().st_mtime_ns
+    assert not list(chunks.rglob("retry.json"))
+    assert not any(
+        pathlib.Path(x).exists()
+        for p in chunks.rglob("scratch-paths")
+        for x in p.read_text().splitlines()
+    )
+    manifest = json.loads((root / "export/manifest.json").read_text())
+    assert all(x["status"] == "complete" for x in manifest["chunks"])
+
+
+def test_many_permission_errors_recover_after_more_than_two_failures(setup):
+    root, args = setup
+    pl.DataFrame({"id": ["RETRY" + chr(65 + i) for i in range(12)]}).write_parquet(args["metadata"])
+    args.update(chunk_size=1, retry_delay=0.02, retry_max_delay=0.05)
+    export.export_main(**args, workers=4)
+    assert all(len(p.read_text().splitlines()) == 4 for p in root.rglob("attempts"))
+    assert len(json.loads((root / "export/manifest.json").read_text())["chunks"]) == 12
+
+
+def test_permission_retry_survives_interrupt_and_restart(setup):
+    root, args = setup
+    pl.DataFrame({"id": ["AAAAAA", "PERMAL"]}).write_parquet(args["metadata"])
+    args.update(chunk_size=1, retry_delay=0.1, retry_max_delay=0.2)
+    command = [sys.executable, str(DATA_SCRIPTS / "export_conquest.py")]
+    for key, value in args.items():
+        command.extend(["--" + key, json.dumps(value) if isinstance(value, list) else str(value)])
+    proc = subprocess.Popen(
+        command + ["--workers", "1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    try:
+        retry_path = root / "export/chunks/000001-/retry.json"
+        deadline = time.monotonic() + 15
+        while not retry_path.exists() or json.loads(retry_path.read_text())["attempts"] < 3:
+            assert proc.poll() is None
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        proc.terminate()
+        assert proc.wait(timeout=10) != 0
+        assert not (root / "export/manifest.json").exists()
+        completed = root / "export/chunks/000000-/state.json"
+        before = completed.stat().st_mtime_ns
+        (retry_path.parent / "recovered").touch()
+        export.export_main(**args, workers=4)
+        assert completed.stat().st_mtime_ns == before
+        assert not retry_path.exists()
+        assert not any(
+            pathlib.Path(x).exists()
+            for p in root.rglob("scratch-paths")
+            for x in p.read_text().splitlines()
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
