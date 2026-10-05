@@ -104,6 +104,9 @@ class Exporter:
             self.command,
             "-j",
             "export",
+            # ConQuest otherwise shares ~/csds_data/searches/batch27 across processes.
+            "-user-directory",
+            str(directory / "conquest-user"),
             "-db",
             *self.databases,
             "-require",

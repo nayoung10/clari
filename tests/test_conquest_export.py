@@ -23,6 +23,8 @@ FAKE = """#!/usr/bin/env python3
 import pathlib, sys, os, time
 if '-version' in sys.argv:
     print('Fake ConQuest 1'); sys.exit(0)
+scratch = pathlib.Path(sys.argv[sys.argv.index('-user-directory')+1])
+assert scratch == pathlib.Path.cwd() / 'conquest-user'
 ids = pathlib.Path(sys.argv[sys.argv.index('-restrict')+1]).read_text().split()
 with pathlib.Path('attempts').open('a') as f: f.write('run\\n')
 if 'SLOWWW' in ids and not pathlib.Path('slow-once').exists():
