@@ -159,7 +159,7 @@ def _run_rows(
             return
         shard_dir.mkdir(exist_ok=True)
         shard_rows = [results[row_idx] for row_idx in rows_by_id[cid]]
-        pl.DataFrame(shard_rows).sort("sample_idx").write_csv(shard_dir / f"{cid}.csv")
+        pl.DataFrame(shard_rows, infer_schema_length=None).sort("sample_idx").write_csv(shard_dir / f"{cid}.csv")
         written_shards.add(cid)
 
     def update(result: dict) -> None:
@@ -302,7 +302,7 @@ def compack(
     )
 
     all_results = list(shard_results.values()) + new_results
-    pl.DataFrame(all_results).select("sample_idx", "nmatched", "rmsd").sort("sample_idx").write_csv(
+    pl.DataFrame(all_results, infer_schema_length=None).select("sample_idx", "nmatched", "rmsd").sort("sample_idx").write_csv(
         csv_path
     )
 
@@ -322,7 +322,7 @@ def compack(
     }
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     print(f"Saved {len(all_results)} results to {csv_path}")
-    return pl.DataFrame(all_results)
+    return pl.DataFrame(all_results, infer_schema_length=None)
 
 
 def main():
