@@ -181,7 +181,7 @@ class CrystalDataModule(L.LightningDataModule):
                 "{train,val,test}.pt."
             )
         with open(config_path, "r") as f:
-            self.artifact = json.load(f)["artifact"]
+            self.artifact = json.load(f).get("artifact")  # absent when built with --logging false
 
         datasets = dict()
 
