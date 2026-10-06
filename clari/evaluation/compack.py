@@ -28,7 +28,8 @@ from tqdm import tqdm
 
 DATA_DIR = Path(os.environ.get("CLARI_DATA_DIR", Path.cwd() / "data"))
 RESULTS_DIR = Path(os.environ.get("CLARI_RESULTS_DIR", Path.cwd() / "results"))
-GT_CIFS_PATH = DATA_DIR / "csd" / "test_cifs.parquet"
+# CLARI_GT_CIFS: optional alternative GT cache, e.g. symmetric CSD CIFs from build_test_cifs_csd.py
+GT_CIFS_PATH = Path(os.environ.get("CLARI_GT_CIFS", DATA_DIR / "csd" / "test_cifs.parquet"))
 
 SETTINGS = dict(
     allow_artificial_inversion=True,
