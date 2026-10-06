@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import pathlib
@@ -345,7 +346,7 @@ def check_metadata(row, max_r_factor, max_deposition_date):
             raise CrystalError(reason)
 
 
-def crystal_from_cif_and_mol(row, max_r_factor, max_deposition_date, max_atoms):
+def crystal_from_cif_and_mol(row, max_r_factor, max_deposition_date, max_atoms, check_meta=True):
     cif, mol2 = row.pop("cif"), row.pop("mol2")
     r_factor = row["r_factor"]
     csd_id = row["id"]
@@ -356,7 +357,8 @@ def crystal_from_cif_and_mol(row, max_r_factor, max_deposition_date, max_atoms):
             max_atoms = None
             max_r_factor = None
             max_deposition_date = None
-        check_metadata(row, max_r_factor, max_deposition_date)
+        if check_meta:
+            check_metadata(row, max_r_factor, max_deposition_date)
         crystal = process_example(
             cif=cif,
             mol=mol2,
@@ -482,9 +484,16 @@ def main(
     max_r_factor: float = 10.0,
     max_deposition_date: date = date(2025, 5, 1),
     max_atoms: int = 512,
+    split_file: str | None = None,
 ):
+    """split_file: optional CSV (id, split), e.g. upstream's released csd-split.csv. When given, only the
+    listed entries are processed, metadata filters and the atom limit are skipped (the entries already passed
+    them upstream), and splits are taken from the file instead of being derived. Structural checks still apply.
+    """
     config = dict(locals())
     config["max_deposition_date"] = str(config["max_deposition_date"])
+    if split_file is not None:
+        config["split_file_sha256"] = hashlib.sha256(pathlib.Path(split_file).read_bytes()).hexdigest()
     if logging:
         wandb.init(project="clari-data", dir=LOG_DIR, config=config)
 
@@ -493,6 +502,12 @@ def main(
     os.environ["OMP_NUM_THREADS"] = str(num_threads)
 
     source = read_raw_data(in_metadata, in_cif_mol2)
+    if split_file is not None:
+        splits = pl.read_csv(split_file, schema_overrides={"id": pl.String, "split": pl.String})
+        assert splits["id"].is_unique().all(), "duplicate ids in split file"
+        missing = splits.join(source.select("id"), on="id", how="anti")
+        print(f"Split file: {len(splits)} entries, {len(missing)} not in source")
+        source = source.join(splits.select("id"), on="id", how="semi")
     if debug > 0:
         source = source.sample(n=debug, seed=0)
     print(f"Loaded {len(source)} entries")
@@ -501,7 +516,8 @@ def main(
         crystal_from_cif_and_mol,
         max_r_factor=max_r_factor,
         max_deposition_date=max_deposition_date,
-        max_atoms=max_atoms,
+        max_atoms=(None if split_file is not None else max_atoms),
+        check_meta=(split_file is None),
     )
 
     processed = pmap(
@@ -531,7 +547,12 @@ def main(
     metadata = pl.from_dicts(metadata, schema=metadata_schema).sort("id")
 
     # Split dataset
-    metadata = split_dataset(metadata, crystals)
+    if split_file is not None:
+        metadata = metadata.join(splits, on="id", how="left")
+        pathlib.Path(out).mkdir(exist_ok=True)
+        missing.write_csv(pathlib.Path(out) / "split_file_missing.csv")
+    else:
+        metadata = split_dataset(metadata, crystals)
 
     # Save to disk
     write_dataset(
